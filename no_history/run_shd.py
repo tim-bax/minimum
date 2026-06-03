@@ -32,7 +32,7 @@ if _ROOT not in sys.path:
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-from data.shd_binned import load_shd_binned
+from data.shd_binned import load_shd_binned, apply_channel_shift
 from config import NeuronConfig
 from network import Network
 
@@ -53,6 +53,15 @@ def apply_temporal_jitter(x_input, jitter_range: int):
     out = np.zeros_like(x_np)
     np.add.at(out, shifted_t, x_np)
     return out
+
+
+def augment_sample(x, args):
+    """Apply enabled training-time augmentations to one sample (training only)."""
+    if args.augment_jitter:
+        x = apply_temporal_jitter(x, args.jitter_range)
+    if args.augment_channel_shift:
+        x = apply_channel_shift(x, args.channel_shift_range)
+    return x
 
 
 def parse_args():
@@ -114,6 +123,18 @@ def parse_args():
         default=10,
         help="Temporal jitter range in timesteps (uniform in [-range, +range]).",
     )
+    p.add_argument(
+        "--augment_channel_shift",
+        action="store_true",
+        help="Enable channel-shift augmentation on training inputs only.",
+    )
+    p.add_argument(
+        "--channel_shift_range",
+        type=int,
+        default=5,
+        help="Channel-shift range in channels (uniform in [-range, +range]); "
+             "operates on the collapsed channel axis.",
+    )
     p.add_argument("--weight_decay", type=float, default=0.0,
                    help="Decoupled weight decay (AdamW-style for Adam, "
                         "L2-equivalent for SGD). Typical: 1e-5 to 1e-3.")
@@ -174,6 +195,8 @@ def main():
         )
     if args.jitter_range < 0:
         raise ValueError("--jitter_range must be >= 0")
+    if args.channel_shift_range < 0:
+        raise ValueError("--channel_shift_range must be >= 0")
     np.random.seed(args.seed)
     key = random.PRNGKey(args.seed)
     B = args.batch_size
@@ -245,10 +268,13 @@ def main():
     jitter_str = ""
     if args.augment_jitter:
         jitter_str = f"  augment_jitter=True(range=±{args.jitter_range})"
+    chan_shift_str = ""
+    if args.augment_channel_shift:
+        chan_shift_str = f"  augment_channel_shift=True(range=±{args.channel_shift_range})"
     wd_str = f"  weight_decay={args.weight_decay}" if args.weight_decay > 0 else ""
     print(
         f"Network: {n_inputs} -> {args.n_hidden} (2-comp) -> {args.n_outputs} (LIF readout)  "
-        f"optimizer={opt_str}  lr={args.lr}{drop_str}{jitter_str}{wd_str}",
+        f"optimizer={opt_str}  lr={args.lr}{drop_str}{jitter_str}{chan_shift_str}{wd_str}",
         flush=True,
     )
 
@@ -292,17 +318,14 @@ def main():
 
             if B == 1:
                 x, y = train_data[int(batch_idx[0])]
-                if args.augment_jitter:
-                    x = apply_temporal_jitter(x, args.jitter_range)
+                x = augment_sample(x, args)
                 loss, pred, gnorms = net.train_step(
                     jnp.array(x), int(y), lr=current_lr, clip_value=args.gradient_clip,
                 )
                 batch_correct = int(pred == int(y))
             else:
                 x_batch_np = [
-                    apply_temporal_jitter(train_data[int(i)][0], args.jitter_range)
-                    if args.augment_jitter
-                    else train_data[int(i)][0]
+                    augment_sample(train_data[int(i)][0], args)
                     for i in batch_idx
                 ]
                 x_batch = jnp.stack(x_batch_np)

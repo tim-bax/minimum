@@ -175,6 +175,42 @@ def bin_shd_sample(
     return x
 
 
+def apply_channel_shift(x: np.ndarray, shift_range: int) -> np.ndarray:
+    """Shift all channels of one sample up/down by a uniform integer offset.
+
+    Channel-axis analogue of the temporal-jitter augmentation, with drop +
+    zero-fill (no clamping, no wrap):
+
+    - One shift per sample (same offset for every timestep / all channels).
+    - shift = np.random.randint(-shift_range, shift_range + 1)  # inclusive, may be 0
+    - Positive shift s ("up"): channel c -> c+s; the top s channels are pushed
+      out and discarded, the bottom s channels become 0. Negative shift is the
+      mirror image.
+    - Operates on axis 1 (channels) of an (T, C) array.
+
+    Args:
+        x:           (T, C) sample array.
+        shift_range: max absolute shift in channels; <= 0 returns x unchanged.
+
+    Returns:
+        Shifted (T, C) array (same shape and dtype).
+    """
+    if shift_range <= 0:
+        return np.asarray(x)
+    x_np = np.asarray(x)
+    C = x_np.shape[1]
+    shift = int(np.random.randint(-shift_range, shift_range + 1))
+    if shift == 0:
+        return x_np
+    out = np.zeros_like(x_np)
+    if shift > 0:
+        out[:, shift:] = x_np[:, : C - shift]
+    else:
+        k = -shift
+        out[:, : C - k] = x_np[:, k:]
+    return out
+
+
 class SHDBinnedLoader:
     """SHD loader that returns dense count-binned tensors.
 
