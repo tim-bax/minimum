@@ -118,6 +118,13 @@ def run_trial(trial, args, train_data, test_data, n_inputs):
     beta_s = suggest_or_static(trial, "beta_s", args.beta_s)
     beta_d = suggest_or_static(trial, "beta_d", args.beta_d)
 
+    print(
+        f"\n--- Trial {trial.number + 1}/{args.n_trials} ---"
+        f"  lr={lr:.4g}  temp={loss_temperature:.4g}  bias={loss_count_bias:.4g}"
+        f"  smooth={loss_label_smoothing:.4g}  beta_s={beta_s:.4g}  beta_d={beta_d:.4g}",
+        flush=True,
+    )
+
     config = NeuronConfig(
         dt=args.bin_size_ms,
         tau_soma=args.tau_soma,
@@ -186,13 +193,21 @@ def run_trial(trial, args, train_data, test_data, n_inputs):
 
         test_acc = evaluate(net, test_data, B)
 
-        if test_acc > best_test_acc:
+        improved = test_acc > best_test_acc
+        if improved:
             best_test_acc = test_acc
             epochs_since_lr_drop = 0
             epochs_without_improvement = 0
         else:
             epochs_since_lr_drop += 1
             epochs_without_improvement += 1
+
+        marker = "*" if improved else " "
+        print(
+            f"  Epoch {epoch:2d}/{args.epochs}  test_acc={test_acc:.2f}%{marker}"
+            f"  lr={current_lr:.2e}",
+            flush=True,
+        )
 
         trial.report(test_acc, epoch)
         if trial.should_prune():
@@ -320,6 +335,7 @@ def main():
     print("Parameter configuration:")
     for name, vals in zip(tunable_names, tunable_values):
         print(f"  {name:25s}  {_describe_param(name, vals)}")
+    print(f"  {'weight_scale':25s}  static={args.weight_scale}  (bin_size_ms={args.bin_size_ms}ms)")
     print(flush=True)
 
     np.random.seed(args.seed)
@@ -371,7 +387,6 @@ def main():
         objective,
         n_trials=args.n_trials,
         n_jobs=args.n_jobs,
-        callbacks=[_trial_callback],
     )
 
     print("\n=== Best trial ===")
@@ -389,25 +404,6 @@ def main():
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     pruned = [t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED]
     print(f"\nCompleted: {len(completed)}  Pruned: {len(pruned)}")
-
-
-def _trial_callback(study, trial):
-    state_str = {
-        optuna.trial.TrialState.COMPLETE: "done",
-        optuna.trial.TrialState.PRUNED: "pruned",
-        optuna.trial.TrialState.FAIL: "FAILED",
-    }.get(trial.state, str(trial.state))
-
-    value_str = f"{trial.value:.2f}%" if trial.value is not None else "—"
-    best_str = f"{study.best_value:.2f}%" if study.best_value is not None else "—"
-    params_str = "  ".join(
-        f"{k}={v:.4g}" for k, v in sorted(trial.params.items())
-    )
-    print(
-        f"Trial {trial.number:4d} [{state_str:7s}]  acc={value_str:7s}  "
-        f"best={best_str:7s}  {params_str}",
-        flush=True,
-    )
 
 
 if __name__ == "__main__":
