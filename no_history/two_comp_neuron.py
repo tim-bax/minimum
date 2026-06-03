@@ -11,6 +11,7 @@ class TwoCompNeuron:
         self.config = config
         self.alpha_s = jnp.exp(-config.dt / config.tau_soma)
         self.alpha_d = jnp.exp(-config.dt / config.tau_dend)
+        self.alpha_w = jnp.exp(-config.dt / config.tau_w)
 
         key1, key2, key3 = random.split(key, 3)
         tau_plat_values = random.uniform(
@@ -35,12 +36,13 @@ class TwoCompNeuron:
             jnp.zeros(k),                  # E_soma
             jnp.zeros((n, k)),             # dmu_dw
             jnp.zeros((n, k)),             # dmu_dw_at_tprime
+            jnp.zeros(n),                  # w (adaptation variable)
         )
 
     @staticmethod
-    def forward_step(carry, dend_in, soma_in, t, alpha_s, alpha_d, T_p, config):
+    def forward_step(carry, dend_in, soma_in, t, alpha_s, alpha_d, T_p, config, alpha_w):
         """Pure-function forward step for one timestep. JIT-friendly."""
-        mu_prev, v_prev, h_prev, t_prime_prev, mu_at_tprime_prev, E_soma, dmu_dw, dmu_dw_at_tprime = carry
+        mu_prev, v_prev, h_prev, t_prime_prev, mu_at_tprime_prev, E_soma, dmu_dw, dmu_dw_at_tprime, w_prev = carry
 
         t_prime = jnp.where(t == 0, 0, jnp.where(h_prev == 1, t_prime_prev, t))
         mu = jnp.where(t > 0, alpha_d * mu_prev + (1 - h_prev) * dend_in, dend_in)
@@ -54,11 +56,12 @@ class TwoCompNeuron:
             1, 0,
         ).astype(jnp.int32)
 
-        v_pre_reset = jnp.where(t > 0, alpha_s * v_prev + soma_in, soma_in)
+        v_pre_reset = jnp.where(t > 0, alpha_s * v_prev + soma_in - w_prev, soma_in)
         o = jnp.where(v_pre_reset >= config.v_th - config.gamma * h, 1, 0).astype(jnp.int32)
         v = v_pre_reset * (1 - o)
+        w = alpha_w * w_prev + (1 - alpha_w) * config.a_adapt * v_pre_reset + config.b_adapt * o
 
-        new_carry = (mu, v, h, t_prime, mu_at_tprime, E_soma, dmu_dw, dmu_dw_at_tprime)
+        new_carry = (mu, v, h, t_prime, mu_at_tprime, E_soma, dmu_dw, dmu_dw_at_tprime, w)
         return new_carry, o, v_pre_reset, h, h_prev, mu_at_tprime
 
     @staticmethod

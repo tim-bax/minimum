@@ -16,7 +16,7 @@ from lif_neuron import LINeuron
 
 def _forward_and_accum(
     x_input, w_dend, w_soma, w_readout,
-    alpha_s, alpha_d, alpha_m, T_p, config,
+    alpha_s, alpha_d, alpha_m, T_p, config, alpha_w,
     h_carry_init, r_carry_init, A_d_init,
     rng_key, dropout_rate,
 ):
@@ -44,7 +44,7 @@ def _forward_and_accum(
         dend_in, soma_in, x_t, t, drop_key = inputs
 
         h_carry, h_o, h_v_pre, h_h, h_h_prev, h_mu_at_tp = TwoCompNeuron.forward_step(
-            h_carry, dend_in, soma_in, t, alpha_s, alpha_d, T_p, config,
+            h_carry, dend_in, soma_in, t, alpha_s, alpha_d, T_p, config, alpha_w,
         )
         hidden_o_float = h_o.astype(jnp.float64)
 
@@ -58,14 +58,14 @@ def _forward_and_accum(
             r_carry, hidden_o_float, w_readout, alpha_m,
         )
 
-        mu_c, v_c, h_c, tp_c, matp_c, E_soma_c, dmu_c, dmu_atp_c = h_carry
+        mu_c, v_c, h_c, tp_c, matp_c, E_soma_c, dmu_c, dmu_atp_c, w_c = h_carry
         E_soma_new = TwoCompNeuron.update_somatic_eligibility(
             E_soma_c, x_t.astype(jnp.float64), alpha_s,
         )
         dmu_new, dmu_atp_new = TwoCompNeuron.update_dendritic_eligibility(
             dmu_c, dmu_atp_c, x_t.astype(jnp.float64), h_h_prev, alpha_d,
         )
-        h_carry = (mu_c, v_c, h_c, tp_c, matp_c, E_soma_new, dmu_new, dmu_atp_new)
+        h_carry = (mu_c, v_c, h_c, tp_c, matp_c, E_soma_new, dmu_new, dmu_atp_new, w_c)
 
         # LI readout is linear in its inputs: ∂v_j/∂input = 1, no surrogate needed.
         sp_readout = jnp.ones(w_readout.shape[0])
@@ -99,7 +99,7 @@ def _forward_and_accum(
 
 def _predict_only(
     x_input, w_dend, w_soma, w_readout,
-    alpha_s, alpha_d, alpha_m, T_p, config,
+    alpha_s, alpha_d, alpha_m, T_p, config, alpha_w,
 ):
     """Forward pass only — no gradient bookkeeping. Returns readout_counts (J,)."""
     dend_inputs = x_input @ w_dend.T
@@ -110,7 +110,7 @@ def _predict_only(
     time_indices = jnp.arange(T, dtype=jnp.int32)
 
     def step(carry, inputs):
-        mu, v, h, t_prime, mu_at_tp, r_v, r_counts = carry
+        mu, v, h, t_prime, mu_at_tp, w, r_v, r_counts = carry
         dend_in, soma_in, t = inputs
 
         t_prime_new = jnp.where(t == 0, 0, jnp.where(h == 1, t_prime, t))
@@ -123,23 +123,25 @@ def _predict_only(
             1, 0,
         ).astype(jnp.int32)
 
-        v_pre = jnp.where(t > 0, alpha_s * v + soma_in, soma_in)
+        v_pre = jnp.where(t > 0, alpha_s * v + soma_in - w, soma_in)
         o_h = jnp.where(v_pre >= config.v_th - config.gamma * h_new, 1, 0).astype(jnp.int32)
         v_new = v_pre * (1 - o_h)
+        w_new = alpha_w * w + (1 - alpha_w) * config.a_adapt * v_pre + config.b_adapt * o_h
 
         r_in = o_h.astype(jnp.float64) @ w_readout.T
         r_v_new = alpha_m * r_v + r_in  # no threshold, no reset
         r_counts_new = r_counts + r_v_new  # accumulate voltage sum
 
-        return (mu_new, v_new, h_new, t_prime_new, mu_at_tp_new, r_v_new, r_counts_new), None
+        return (mu_new, v_new, h_new, t_prime_new, mu_at_tp_new, w_new, r_v_new, r_counts_new), None
 
     init = (
         jnp.zeros(n_hidden), jnp.zeros(n_hidden),
         jnp.zeros(n_hidden, dtype=jnp.int32), jnp.zeros(n_hidden, dtype=jnp.int32),
-        jnp.zeros(n_hidden), jnp.zeros(n_outputs), jnp.zeros(n_outputs),
+        jnp.zeros(n_hidden), jnp.zeros(n_hidden),
+        jnp.zeros(n_outputs), jnp.zeros(n_outputs),
     )
     final, _ = lax.scan(step, init, (dend_inputs, soma_inputs, time_indices))
-    return final[6] / T  # mean voltage
+    return final[7] / T  # mean voltage
 
 
 def _loss_and_grads(
@@ -225,20 +227,22 @@ def _adam_apply(
 # ══════════════════════════════════════════════════════════════════════
 
 _FWD_AXES = (
-    0,                            # x_input
-    None, None, None,             # w_dend, w_soma, w_readout
-    None, None, None, None, None, # alpha_s, alpha_d, alpha_m, T_p, config
-    (0, 0, 0, 0, 0, 0, 0, 0),    # h_carry_init (8-tuple, each batched)
-    (0, 0, 0),                    # r_carry_init (3-tuple, each batched)
-    0,                            # A_d_init
-    0,                            # rng_key (per-sample)
-    None,                         # dropout_rate (shared)
+    0,                               # x_input
+    None, None, None,                # w_dend, w_soma, w_readout
+    None, None, None, None, None,    # alpha_s, alpha_d, alpha_m, T_p, config
+    None,                            # alpha_w (shared)
+    (0, 0, 0, 0, 0, 0, 0, 0, 0),    # h_carry_init (9-tuple, each batched)
+    (0, 0, 0),                       # r_carry_init (3-tuple, each batched)
+    0,                               # A_d_init
+    0,                               # rng_key (per-sample)
+    None,                            # dropout_rate (shared)
 )
 
 _PRED_AXES = (
     0,                            # x_input
     None, None, None,             # weights
     None, None, None, None, None, # alphas, T_p, config
+    None,                         # alpha_w
 )
 
 _LOSS_AXES = (
@@ -322,6 +326,7 @@ class Network:
             jnp.zeros(s, dtype=jnp.int32), jnp.zeros(s, dtype=jnp.int32),
             jnp.zeros(s), jnp.zeros(sk),
             jnp.zeros(snk), jnp.zeros(snk),
+            jnp.zeros(s),  # w
         )
 
     def _r_carry(self, B=None):
@@ -341,7 +346,7 @@ class Network:
 
     def _params(self):
         return (self.hidden.alpha_s, self.hidden.alpha_d, self.readout.alpha_m,
-                self.hidden.T_p, self.config)
+                self.hidden.T_p, self.config, self.hidden.alpha_w)
 
     def _smooth_targets(self, targets):
         """Scalar label or (B,) labels → smoothed one-hot vector(s)."""
