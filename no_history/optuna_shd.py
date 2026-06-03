@@ -117,11 +117,15 @@ def run_trial(trial, args, train_data, test_data, n_inputs):
     loss_label_smoothing = suggest_or_static(trial, "loss_label_smoothing", args.loss_label_smoothing)
     beta_s = suggest_or_static(trial, "beta_s", args.beta_s)
     beta_d = suggest_or_static(trial, "beta_d", args.beta_d)
+    tau_w = suggest_or_static(trial, "tau_w", args.tau_w)
+    a_adapt = suggest_or_static(trial, "a_adapt", args.a_adapt)
+    b_adapt = suggest_or_static(trial, "b_adapt", args.b_adapt)
 
     print(
         f"\n--- Trial {trial.number + 1}/{args.n_trials} ---"
         f"  lr={lr:.4g}  temp={loss_temperature:.4g}  bias={loss_count_bias:.4g}"
-        f"  smooth={loss_label_smoothing:.4g}  beta_s={beta_s:.4g}  beta_d={beta_d:.4g}",
+        f"  smooth={loss_label_smoothing:.4g}  beta_s={beta_s:.4g}  beta_d={beta_d:.4g}"
+        f"  tau_w={tau_w:.4g}  a_adapt={a_adapt:.4g}  b_adapt={b_adapt:.4g}",
         flush=True,
     )
 
@@ -132,6 +136,9 @@ def run_trial(trial, args, train_data, test_data, n_inputs):
         tau_m=args.tau_m,
         tau_plat_min=args.tau_plat_min,
         tau_plat_max=args.tau_plat_max,
+        tau_w=tau_w,
+        a_adapt=a_adapt,
+        b_adapt=b_adapt,
         mu_th=args.mu_th,
         v_th=args.v_th,
         gamma=args.gamma,
@@ -253,6 +260,12 @@ def parse_args():
                          metavar="VAL", help="Somatic surrogate gradient scale.")
     tunable.add_argument("--beta_d", nargs="+", default=["1.5"],
                          metavar="VAL", help="Dendritic surrogate gradient scale.")
+    tunable.add_argument("--tau_w", nargs="+", default=["100.0"],
+                         metavar="VAL", help="Adaptation time constant (ms).")
+    tunable.add_argument("--a_adapt", nargs="+", default=["0.0"],
+                         metavar="VAL", help="Subthreshold adaptation coupling.")
+    tunable.add_argument("--b_adapt", nargs="+", default=["0.0"],
+                         metavar="VAL", help="Spike-triggered adaptation jump.")
 
     # ---- Optuna study settings ----
     study = p.add_argument_group("optuna study")
@@ -289,6 +302,10 @@ def parse_args():
     p.add_argument("--mu_th", type=float, default=1.0)
     p.add_argument("--v_th", type=float, default=1.0)
     p.add_argument("--gamma", type=float, default=0.5)
+    p.add_argument("--train_fraction", type=float, default=1.0,
+                   help="Fraction of training data to use per trial (default 1.0 = all).")
+    p.add_argument("--test_fraction", type=float, default=1.0,
+                   help="Fraction of test data to use for evaluation (default 1.0 = all).")
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--augment_jitter", action="store_true")
     p.add_argument("--jitter_range", type=int, default=10)
@@ -326,9 +343,11 @@ def main():
 
     # Validate all tunable param specs early so we fail fast.
     tunable_names = ["lr", "loss_temperature", "loss_count_bias",
-                     "loss_label_smoothing", "beta_s", "beta_d"]
+                     "loss_label_smoothing", "beta_s", "beta_d",
+                     "tau_w", "a_adapt", "b_adapt"]
     tunable_values = [args.lr, args.loss_temperature, args.loss_count_bias,
-                      args.loss_label_smoothing, args.beta_s, args.beta_d]
+                      args.loss_label_smoothing, args.beta_s, args.beta_d,
+                      args.tau_w, args.a_adapt, args.b_adapt]
     for name, vals in zip(tunable_names, tunable_values):
         parse_param(name, vals)  # raises on bad input
 
@@ -355,6 +374,14 @@ def main():
 
     train_data = [(X_tr[i], int(y_tr[i])) for i in range(len(y_tr))]
     test_data = [(X_te[i], int(y_te[i])) for i in range(len(y_te))]
+
+    if args.train_fraction < 1.0:
+        n = max(1, int(len(train_data) * args.train_fraction))
+        train_data = train_data[:n]
+    if args.test_fraction < 1.0:
+        n = max(1, int(len(test_data) * args.test_fraction))
+        test_data = test_data[:n]
+
     n_inputs = train_data[0][0].shape[1]
     print(
         f"Train: {len(train_data)}  Test: {len(test_data)}  "
