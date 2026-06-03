@@ -96,6 +96,12 @@ def parse_args():
                    help="Somatic spike threshold (default 1.0). Lower if neurons rarely spike.")
     p.add_argument("--gamma", type=float, default=0.5,
                    help="Plateau-induced threshold reduction (default 0.5). Effective v_th = v_th - gamma*h.")
+    p.add_argument("--tau_w", type=float, default=100.0,
+                   help="Adaptation current time constant (ms; default 100.0).")
+    p.add_argument("--a_adapt", type=float, default=0.0,
+                   help="Subthreshold adaptation coupling (default 0.0 = disabled).")
+    p.add_argument("--b_adapt", type=float, default=0.0,
+                   help="Spike-triggered adaptation jump size (default 0.0 = disabled).")
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument(
         "--augment_jitter",
@@ -204,6 +210,9 @@ def main():
         tau_m=args.tau_m,
         tau_plat_min=args.tau_plat_min,
         tau_plat_max=args.tau_plat_max,
+        tau_w=args.tau_w,
+        a_adapt=args.a_adapt,
+        b_adapt=args.b_adapt,
         mu_th=args.mu_th,
         v_th=args.v_th,
         gamma=args.gamma,
