@@ -44,17 +44,25 @@ ZENKE_BASE_URL = "https://zenkelab.org/datasets"
 def _open_hdf5(hdf5_path: str):
     """Open an HDF5 file with PyTables if available, else h5py.
 
-    Returns (file_handle, units_dataset, times_dataset, labels_array, use_h5py_flag).
+    Returns (file_handle, units_dataset, times_dataset, labels_array,
+             speaker_array_or_None, use_h5py_flag).
+    `speaker_array` is the per-sample speaker id (SHD stores it under
+    extra/speaker); None if the file has no such field.
     Imports are deferred so the binning helpers can be used without hdf5 deps installed.
     """
     try:
         import tables  # noqa: WPS433
         fh = tables.open_file(hdf5_path, mode="r")
+        try:
+            speaker = np.asarray(fh.root.extra.speaker, dtype=np.int64)
+        except (AttributeError, tables.NoSuchNodeError):
+            speaker = None
         return (
             fh,
             fh.root.spikes.units,
             fh.root.spikes.times,
             np.asarray(fh.root.labels, dtype=np.int64),
+            speaker,
             False,
         )
     except (ImportError, ValueError):
@@ -66,11 +74,17 @@ def _open_hdf5(hdf5_path: str):
                 "pip install h5py"
             ) from e
         fh = h5py.File(hdf5_path, mode="r")
+        speaker = (
+            np.asarray(fh["extra"]["speaker"], dtype=np.int64)
+            if "extra" in fh and "speaker" in fh["extra"]
+            else None
+        )
         return (
             fh,
             fh["spikes"]["units"],
             fh["spikes"]["times"],
             np.asarray(fh["labels"], dtype=np.int64),
+            speaker,
             True,
         )
 
@@ -248,12 +262,14 @@ class SHDBinnedLoader:
         target_classes: Optional[List[int]] = None,
         binarize: bool = False,
         dtype=np.float32,
+        with_speaker: bool = False,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Returns (X, y, lengths):
-            X       : (N, T_bins, n_channels_out) float array
-            y       : (N,)                         int64
-            lengths : (N,)                         int64, last populated time bin + 1
-                      (useful if you want to mask the trailing zeros)
+        """Returns (X, y, lengths) — or (X, y, lengths, speakers) if with_speaker.
+            X        : (N, T_bins, n_channels_out) float array
+            y        : (N,)                         int64
+            lengths  : (N,)                         int64, last populated time bin + 1
+                       (useful if you want to mask the trailing zeros)
+            speakers : (N,)                         int64 per-sample speaker id
         """
         if target_classes is None:
             target_classes = list(range(20))
@@ -262,11 +278,17 @@ class SHDBinnedLoader:
         filename = f"shd_{split}.h5.gz"
         hdf5_path = _download_and_gunzip(filename, cache_dir=self.data_path)
 
-        fh, units_ds, times_ds, labels, use_h5py = _open_hdf5(hdf5_path)
+        fh, units_ds, times_ds, labels, speaker, use_h5py = _open_hdf5(hdf5_path)
+        if with_speaker and speaker is None:
+            fh.close()
+            raise ValueError(
+                f"with_speaker=True but no extra/speaker field in shd_{split}.h5"
+            )
 
         xs: List[np.ndarray] = []
         ys: List[int] = []
         lens: List[int] = []
+        spk: List[int] = []
         class_counts = {c: 0 for c in target_classes}
 
         for i in range(labels.shape[0]):
@@ -293,6 +315,8 @@ class SHDBinnedLoader:
             xs.append(x)
             ys.append(label)
             lens.append(length)
+            if speaker is not None:
+                spk.append(int(speaker[i]))
             class_counts[label] += 1
 
         fh.close()
@@ -307,6 +331,7 @@ class SHDBinnedLoader:
 
         y = np.asarray(ys, dtype=np.int64)
         lengths = np.asarray(lens, dtype=np.int64)
+        speakers = np.asarray(spk, dtype=np.int64)
 
         print(
             f"[shd_binned/{split}] N={X.shape[0]}, "
@@ -317,6 +342,8 @@ class SHDBinnedLoader:
             f"median length={int(np.median(lengths))} bins",
             flush=True,
         )
+        if with_speaker:
+            return X, y, lengths, speakers
         return X, y, lengths
 
 
@@ -330,11 +357,13 @@ def load_shd_binned(
     binarize: bool = False,
     dtype=np.float32,
     data_path: Optional[str] = None,
+    return_speakers: bool = False,
 ):
     """Convenience: load both train+test in the paper's preprocessing.
 
     Returns:
         X_train, y_train, len_train, X_test, y_test, len_test
+        (+ spk_train, spk_test appended when return_speakers=True)
     """
     loader = SHDBinnedLoader(
         data_path=data_path,
@@ -342,20 +371,28 @@ def load_shd_binned(
         collapse_factor=collapse_factor,
         max_duration_ms=max_duration_ms,
     )
-    X_tr, y_tr, L_tr = loader.get_dataset_binned(
+    tr = loader.get_dataset_binned(
         "train",
         max_samples_per_class=train_samples_per_class,
         target_classes=target_classes,
         binarize=binarize,
         dtype=dtype,
+        with_speaker=return_speakers,
     )
-    X_te, y_te, L_te = loader.get_dataset_binned(
+    te = loader.get_dataset_binned(
         "test",
         max_samples_per_class=test_samples_per_class,
         target_classes=target_classes,
         binarize=binarize,
         dtype=dtype,
+        with_speaker=return_speakers,
     )
+    if return_speakers:
+        X_tr, y_tr, L_tr, spk_tr = tr
+        X_te, y_te, L_te, spk_te = te
+        return X_tr, y_tr, L_tr, X_te, y_te, L_te, spk_tr, spk_te
+    X_tr, y_tr, L_tr = tr
+    X_te, y_te, L_te = te
     return X_tr, y_tr, L_tr, X_te, y_te, L_te
 
 

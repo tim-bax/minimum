@@ -23,6 +23,7 @@ Each tunable parameter accepts 1, 2, or 3 values:
 If a flag is omitted, the built-in default is used as a static value.
 """
 import argparse
+import datetime
 import os
 import sys
 
@@ -286,9 +287,12 @@ def resolve_params(trial, args):
     return params
 
 
-def run_trial(trial, args, train_set, val_set, n_inputs):
+def run_trial(trial, args, train_set, val_set, n_inputs, fixed_config):
     params = resolve_params(trial, args)
     trial.set_user_attr("params", params)
+    # Record the fixed (non-tunable) geometry this trial ran under, so the trial
+    # is self-documenting and survives study resumes with different settings.
+    trial.set_user_attr("fixed", fixed_config)
 
     print(
         f"\n--- Trial {trial.number + 1}/{args.n_trials} ---"
@@ -308,6 +312,50 @@ def run_trial(trial, args, train_set, val_set, n_inputs):
         seed=args.seed + trial.number, trial=trial, eval_label="val",
     )
     return best_acc
+
+
+def build_fixed_config(args):
+    """Capture every non-tunable run setting as a JSON-serializable dict.
+
+    Stored on the study and on each trial so the DB is self-documenting (the
+    geometry — collapse_factor, bin_size_ms, n_hidden, batch_size, etc. — is no
+    longer something you have to infer from the command line afterwards).
+    """
+    cs_param = "channel_shift_range" if args.channel_shift_range is not None else "channel_shift_raw"
+    return {
+        "collapse_factor": args.collapse_factor,
+        "bin_size_ms": args.bin_size_ms,
+        "max_duration_ms": args.max_duration_ms,
+        "binarize": bool(args.binarize),
+        "input_scale": args.input_scale,
+        "n_hidden": args.n_hidden,
+        "n_outputs": args.n_outputs,
+        "weight_scale": args.weight_scale,
+        "tau_soma": args.tau_soma,
+        "tau_dend": args.tau_dend,
+        "tau_m": args.tau_m,
+        "v_th": args.v_th,
+        "optimizer": args.optimizer,
+        "beta1": args.beta1,
+        "beta2": args.beta2,
+        "adam_eps": args.adam_eps,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "gradient_clip": args.gradient_clip,
+        "lr_min": args.lr_min,
+        "early_stop_patience": args.early_stop_patience,
+        "augment_channel_shift": bool(args.augment_channel_shift),
+        "augment_jitter": bool(args.augment_jitter),
+        "jitter_range": args.jitter_range,
+        "channel_shift_param": cs_param,
+        "train_fraction": args.train_fraction,
+        "val_n_speakers": args.val_n_speakers,
+        "val_speakers": list(args.val_speakers) if args.val_speakers is not None else None,
+        "val_fraction": args.val_fraction,
+        "val_seed": args.val_seed if args.val_seed is not None else args.seed,
+        "seed": args.seed,
+        "precision": args.precision,
+    }
 
 
 # Tunable parameter names whose value lists live on args under the same name.
@@ -389,10 +437,18 @@ def parse_args():
 
     # ---- validation split / subset ----
     splitg = p.add_argument_group("validation split")
+    splitg.add_argument("--val_n_speakers", type=int, default=2,
+                        help="Hold out this many entire TRAIN speakers as the validation split, "
+                             "so val measures unseen-speaker generalization like the SHD test set "
+                             "(default 2). Set 0 to fall back to a random fraction split.")
+    splitg.add_argument("--val_speakers", type=int, nargs="+", default=None,
+                        help="Explicit speaker IDs to hold out as val (overrides --val_n_speakers).")
     splitg.add_argument("--val_fraction", type=float, default=0.2,
-                        help="Fraction of TRAIN carved off as the validation split (default 0.2).")
+                        help="Random-split fallback fraction, used only when --val_n_speakers 0 "
+                             "and no --val_speakers (default 0.2).")
     splitg.add_argument("--val_seed", type=int, default=None,
-                        help="Seed for the train/val split (default: --seed).")
+                        help="Seed for choosing which speakers to hold out / the random split "
+                             "(default: --seed).")
     splitg.add_argument("--train_fraction", type=float, default=1.0,
                         help="Fraction of the train POOL used per trial (fixed seeded subset).")
 
@@ -481,13 +537,20 @@ def main():
 
     dtype = np.float64 if args.precision == "64" else np.float32
     print("Loading SHD data...", flush=True)
-    X_tr, y_tr, _, X_te, y_te, _ = load_shd_binned(
+    use_speakers = args.val_n_speakers > 0 or args.val_speakers is not None
+    loaded = load_shd_binned(
         bin_size_ms=args.bin_size_ms,
         collapse_factor=args.collapse_factor,
         max_duration_ms=args.max_duration_ms,
         binarize=args.binarize,
         dtype=dtype,
+        return_speakers=use_speakers,
     )
+    if use_speakers:
+        X_tr, y_tr, _, X_te, y_te, _, spk_tr, spk_te = loaded
+    else:
+        X_tr, y_tr, _, X_te, y_te, _ = loaded
+        spk_tr = None
     if args.input_scale != 1.0:
         X_tr = X_tr * args.input_scale
         X_te = X_te * args.input_scale
@@ -497,13 +560,37 @@ def main():
 
     # --- carve a fixed validation split off TRAIN (test is reserved) ---
     val_seed = args.val_seed if args.val_seed is not None else args.seed
-    split_rng = np.random.RandomState(val_seed)
-    perm = split_rng.permutation(len(train_data))
-    n_val = max(1, int(round(len(train_data) * args.val_fraction)))
-    val_idx = perm[:n_val]
-    pool_idx = perm[n_val:]
-    val_data = [train_data[int(i)] for i in val_idx]
-    train_pool = [train_data[int(i)] for i in pool_idx]
+    if use_speakers:
+        # Speaker-held-out val: pull aside ALL samples from a few entire train
+        # speakers, so val measures unseen-speaker generalization like test.
+        all_speakers = sorted(set(int(s) for s in spk_tr))
+        if args.val_speakers is not None:
+            held = [int(s) for s in args.val_speakers]
+            missing = [s for s in held if s not in all_speakers]
+            if missing:
+                raise ValueError(f"--val_speakers {missing} not in train speakers {all_speakers}")
+        else:
+            shuf = list(all_speakers)
+            np.random.RandomState(val_seed).shuffle(shuf)
+            held = sorted(shuf[: args.val_n_speakers])
+        held_set = set(held)
+        val_idx = [i for i in range(len(train_data)) if int(spk_tr[i]) in held_set]
+        pool_idx = [i for i in range(len(train_data)) if int(spk_tr[i]) not in held_set]
+        val_data = [train_data[i] for i in val_idx]
+        train_pool = [train_data[i] for i in pool_idx]
+        pool_speakers = sorted(set(int(spk_tr[i]) for i in pool_idx))
+        print(f"Speaker-held-out val: held speakers {held} (of {all_speakers}); "
+              f"train fits on {pool_speakers}", flush=True)
+    else:
+        split_rng = np.random.RandomState(val_seed)
+        perm = split_rng.permutation(len(train_data))
+        n_val = max(1, int(round(len(train_data) * args.val_fraction)))
+        val_idx = perm[:n_val]
+        pool_idx = perm[n_val:]
+        val_data = [train_data[int(i)] for i in val_idx]
+        train_pool = [train_data[int(i)] for i in pool_idx]
+        print(f"Random val split: {len(val_data)} held out by fraction "
+              f"{args.val_fraction} (WARNING: seen-speaker only, weak test proxy)", flush=True)
 
     # --- per-trial training subset of the pool (fixed seeded subset) ---
     if args.train_fraction < 1.0:
@@ -543,8 +630,32 @@ def main():
         load_if_exists=True,
     )
 
+    # --- record the fixed config so the study/DB is self-documenting ---
+    fixed_config = build_fixed_config(args)
+    prev = study.user_attrs.get("fixed_config")
+    if prev is not None and prev != fixed_config:
+        diffs = {k: (prev.get(k), fixed_config.get(k))
+                 for k in set(prev) | set(fixed_config)
+                 if prev.get(k) != fixed_config.get(k)}
+        print("=" * 70, flush=True)
+        print("WARNING: resuming study with a DIFFERENT fixed config than the "
+              "trials already in this DB.\n"
+              "         Existing and new trials are NOT apples-to-apples:", flush=True)
+        for k, (old, new) in sorted(diffs.items()):
+            print(f"           {k}: {old} -> {new}", flush=True)
+        print("=" * 70, flush=True)
+    history = list(study.user_attrs.get("config_history", []))
+    history.append({"time": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "config": fixed_config})
+    study.set_user_attr("config_history", history)
+    study.set_user_attr("fixed_config", fixed_config)
+    print("Fixed config (recorded to study):")
+    for k, v in fixed_config.items():
+        print(f"  {k:22s}  {v}")
+    print(flush=True)
+
     def objective(trial):
-        return run_trial(trial, args, train_subset, val_data, n_inputs)
+        return run_trial(trial, args, train_subset, val_data, n_inputs, fixed_config)
 
     print(f"Starting Optuna study '{args.study_name}' "
           f"({args.n_trials} trials, up to {args.epochs} epochs each, "
@@ -580,10 +691,14 @@ def main():
             best = (full_val_acc, params, t.number)
 
     full_val_acc, best_params, best_trial_no = best
-    print(f"\n=== Best config (trial #{best_trial_no}, full-pool val_acc={full_val_acc:.2f}%) — "
-          f"confirming on TEST once ===", flush=True)
+    # Final test confirmation trains on ALL train speakers (pool + held-out val),
+    # matching real deployment (run_shd.py uses the full train set).
+    full_train = train_pool + val_data
+    print(f"\n=== Best config (trial #{best_trial_no}, held-out val_acc={full_val_acc:.2f}%) — "
+          f"retraining on ALL {len(full_train)} train samples, confirming on TEST once ===",
+          flush=True)
     test_acc, _ = train_and_eval(
-        best_params, args, train_pool, test_data, n_inputs,
+        best_params, args, full_train, test_data, n_inputs,
         seed=args.seed, trial=None, eval_label="test",
     )
 
