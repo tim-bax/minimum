@@ -77,3 +77,18 @@ class TwoCompNeuron:
             dmu_dw_at_tprime_prev,
         )
         return dmu_dw, dmu_dw_at_tprime
+
+    @staticmethod
+    def update_nested_dendritic_eligibility(P_prev, P_at_tprime_prev, sensitivity, h_prev, alpha_d):
+        """Freeze/latch recurrence for a second-order trace on a (N2, N1, K) tensor.
+
+        Identical dynamics to ``update_dendritic_eligibility`` but the "presynaptic"
+        quantity ``sensitivity`` is itself an L1 weight-sensitivity (N2, N1, K),
+        already pre-multiplied by ``w_dend2[m, i]``. The plateau gate ``h_prev``
+        (the L2 plateau state, shape (N2,)) broadcasts over the L1-neuron and
+        input-channel axes. Latches the trace at L2's plateau-initiation time t'.
+        """
+        gate = (1 - h_prev)[:, None, None]
+        P = alpha_d * P_prev + gate * sensitivity
+        P_at_tprime = jnp.where((h_prev == 0)[:, None, None], P, P_at_tprime_prev)
+        return P, P_at_tprime

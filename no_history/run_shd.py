@@ -77,6 +77,9 @@ def parse_args():
     p.add_argument("--input_scale", type=float, default=1.0,
                    help="Multiplicative scale on the binned input (default 1.0; raw counts).")
     p.add_argument("--n_hidden", type=int, default=64)
+    p.add_argument("--n_hidden2", type=int, default=0,
+                   help="Size of an optional second 2-comp hidden layer. "
+                        "0 (default) keeps the single-hidden-layer model.")
     p.add_argument("--n_outputs", type=int, default=20)
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
@@ -262,6 +265,7 @@ def main():
         key, n_inputs, args.n_hidden, args.n_outputs, config,
         optimizer=args.optimizer, beta1=args.beta1, beta2=args.beta2, adam_eps=args.adam_eps,
         dropout_rate=args.dropout, weight_decay=args.weight_decay,
+        n_hidden2=args.n_hidden2,
     )
     opt_str = f"adam(β1={args.beta1},β2={args.beta2})" if args.optimizer == "adam" else "sgd"
     drop_str = f"  dropout={args.dropout}" if args.dropout > 0 else ""
@@ -272,8 +276,13 @@ def main():
     if args.augment_channel_shift:
         chan_shift_str = f"  augment_channel_shift=True(range=±{args.channel_shift_range})"
     wd_str = f"  weight_decay={args.weight_decay}" if args.weight_decay > 0 else ""
+    if args.n_hidden2 > 0:
+        arch_str = (f"{n_inputs} -> {args.n_hidden} (2-comp) -> "
+                    f"{args.n_hidden2} (2-comp) -> {args.n_outputs} (LI readout)")
+    else:
+        arch_str = f"{n_inputs} -> {args.n_hidden} (2-comp) -> {args.n_outputs} (LI readout)"
     print(
-        f"Network: {n_inputs} -> {args.n_hidden} (2-comp) -> {args.n_outputs} (LIF readout)  "
+        f"Network: {arch_str}  "
         f"optimizer={opt_str}  lr={args.lr}{drop_str}{jitter_str}{chan_shift_str}{wd_str}",
         flush=True,
     )
