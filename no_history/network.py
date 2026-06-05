@@ -555,6 +555,85 @@ _loss_batch_2l = jit(vmap(_loss_and_grads_2l, in_axes=_LOSS_AXES_2L))
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  Activity diagnostics — mean firing rate per hidden layer (forward only).
+#  Rate = (total spikes) / (T * n_neurons): fraction of neurons spiking per
+#  step, equivalently the per-neuron probability of spiking on a given step.
+# ══════════════════════════════════════════════════════════════════════
+
+def _activity_1l(
+    x_input, w_dend, w_soma, w_readout,
+    alpha_s, alpha_d, alpha_m, T_p, config, alpha_w,
+):
+    dend_in = x_input @ w_dend.T
+    soma_in = x_input @ w_soma.T
+    T = x_input.shape[0]
+    n = w_dend.shape[0]
+    k = x_input.shape[1]
+    time_indices = jnp.arange(T, dtype=jnp.int32)
+
+    def _zero_h(n, k):
+        return (
+            jnp.zeros(n), jnp.zeros(n),
+            jnp.zeros(n, dtype=jnp.int32), jnp.zeros(n, dtype=jnp.int32),
+            jnp.zeros(n), jnp.zeros(k),
+            jnp.zeros((n, k)), jnp.zeros((n, k)), jnp.zeros(n),
+        )
+
+    def step(carry, inputs):
+        h_carry, s = carry
+        dend_in_t, soma_in_t, t = inputs
+        h_carry, o, *_ = TwoCompNeuron.forward_step(
+            h_carry, dend_in_t, soma_in_t, t, alpha_s, alpha_d, T_p, config, alpha_w,
+        )
+        return (h_carry, s + jnp.sum(o.astype(jnp.float64))), None
+
+    (_, s), _ = lax.scan(step, (_zero_h(n, k), 0.0), (dend_in, soma_in, time_indices))
+    return s / (T * n)
+
+
+def _activity_2l(
+    x_input, w_dend1, w_soma1, w_dend2, w_soma2, w_readout,
+    alpha_s, alpha_d, alpha_m, T_p1, T_p2, config, alpha_w,
+):
+    dend_in1 = x_input @ w_dend1.T
+    soma_in1 = x_input @ w_soma1.T
+    T = x_input.shape[0]
+    n1, n2 = w_dend1.shape[0], w_dend2.shape[0]
+    k = x_input.shape[1]
+    time_indices = jnp.arange(T, dtype=jnp.int32)
+
+    def _zero_h(n, kk):
+        return (
+            jnp.zeros(n), jnp.zeros(n),
+            jnp.zeros(n, dtype=jnp.int32), jnp.zeros(n, dtype=jnp.int32),
+            jnp.zeros(n), jnp.zeros(kk),
+            jnp.zeros((n, kk)), jnp.zeros((n, kk)), jnp.zeros(n),
+        )
+
+    def step(carry, inputs):
+        h1_carry, h2_carry, s1, s2 = carry
+        dend_in1_t, soma_in1_t, t = inputs
+        h1_carry, o1, *_ = TwoCompNeuron.forward_step(
+            h1_carry, dend_in1_t, soma_in1_t, t, alpha_s, alpha_d, T_p1, config, alpha_w,
+        )
+        o1_f = o1.astype(jnp.float64)
+        h2_carry, o2, *_ = TwoCompNeuron.forward_step(
+            h2_carry, o1_f @ w_dend2.T, o1_f @ w_soma2.T, t,
+            alpha_s, alpha_d, T_p2, config, alpha_w,
+        )
+        return (h1_carry, h2_carry, s1 + jnp.sum(o1_f),
+                s2 + jnp.sum(o2.astype(jnp.float64))), None
+
+    init = (_zero_h(n1, k), _zero_h(n2, n1), 0.0, 0.0)
+    (_, _, s1, s2), _ = lax.scan(step, init, (dend_in1, soma_in1, time_indices))
+    return s1 / (T * n1), s2 / (T * n2)
+
+
+_act_batch_1l = jit(vmap(_activity_1l, in_axes=_PRED_AXES))
+_act_batch_2l = jit(vmap(_activity_2l, in_axes=_PRED_AXES_2L))
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  Network class — ties everything together
 # ══════════════════════════════════════════════════════════════════════
 
@@ -913,3 +992,15 @@ class Network:
         else:
             counts = _pred_batch(x_batch, *self._weights(), *self._params())
         return jnp.argmax(counts, axis=1)
+
+    def activity(self, x_batch):
+        """Mean firing rate per hidden layer over a batch (no dropout).
+
+        Rate = spikes / (T * n_neurons): the fraction of neurons spiking per
+        timestep. Returns {"hidden": r} for 1 layer, {"l1": r1, "l2": r2} for 2.
+        """
+        if self.two_layer:
+            r1, r2 = _act_batch_2l(x_batch, *self._weights2(), *self._params2())
+            return {"l1": float(jnp.mean(r1)), "l2": float(jnp.mean(r2))}
+        r = _act_batch_1l(x_batch, *self._weights(), *self._params())
+        return {"hidden": float(jnp.mean(r))}

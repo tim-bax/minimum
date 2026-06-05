@@ -308,6 +308,11 @@ def main():
     log_interval = 1000
     log_every = max(1, log_interval // B)
 
+    # Fixed diagnostic batch (test samples, no augmentation) for per-epoch
+    # firing-rate readout.
+    diag_n = min(len(test_data), 128)
+    diag_x = jnp.stack([test_data[i][0] for i in range(diag_n)]) if diag_n else None
+
     current_lr = args.lr
     best_test_acc = 0.0
     best_epoch = 0
@@ -318,6 +323,8 @@ def main():
         idx = np.random.permutation(n_train)
         losses = []
         correct = 0
+        gnorm_sums = {}
+        gnorm_count = 0
         epoch_t0 = time.time()
         batch_t0 = time.time()
 
@@ -346,6 +353,9 @@ def main():
 
             losses.append(loss)
             correct += batch_correct
+            for k, v in gnorms.items():
+                gnorm_sums[k] = gnorm_sums.get(k, 0.0) + v
+            gnorm_count += 1
 
             if bi == 0 and hasattr(dev, "memory_stats") and dev.memory_stats() is not None:
                 ms = dev.memory_stats()
@@ -393,6 +403,22 @@ def main():
             f"lr={current_lr:.2e} ({epoch_elapsed:.1f}s){marker}",
             flush=True,
         )
+
+        # Per-epoch gradient magnitudes (mean over batches) and firing rates.
+        if gnorm_count > 0:
+            key_order = (["dend1", "soma1", "dend2", "soma2", "readout"]
+                         if args.n_hidden2 > 0 else ["dend", "soma", "readout"])
+            gn_str = "  ".join(
+                f"{k}={gnorm_sums[k] / gnorm_count:.4g}"
+                for k in key_order if k in gnorm_sums
+            )
+            rate_str = ""
+            if diag_x is not None:
+                rates = net.activity(diag_x)
+                rate_str = "  | firing: " + "  ".join(
+                    f"{k}={v:.4f}" for k, v in rates.items()
+                )
+            print(f"         gnorms: {gn_str}{rate_str}", flush=True)
 
         if (args.lr_factor < 1.0
                 and args.lr_patience > 0
