@@ -338,7 +338,8 @@ def resolve_params(trial, args):
     params["channel_shift_range"] = trial.suggest_int(
         "channel_shift_range", args.channel_shift_min, args.channel_shift_max)
     # architecture: 1 hidden layer of 128 vs 2 hidden layers of 64->42.
-    arch = trial.suggest_categorical("arch", list(_ARCH_GEOMETRY.keys()))
+    # (--arch_choices may pin this to a single value for a per-arch sweep.)
+    arch = trial.suggest_categorical("arch", args.arch_choices)
     n_hidden, n_hidden2 = _ARCH_GEOMETRY[arch]
     params["arch"] = arch
     params["n_hidden"] = n_hidden
@@ -424,7 +425,7 @@ def build_fixed_config(args):
         "bin_size_choices": list(args.bin_size_choices),
         "collapse_choices": list(args.collapse_choices),
         "channel_shift_range_bounds": [args.channel_shift_min, args.channel_shift_max],
-        "arch_choices": {k: list(v) for k, v in _ARCH_GEOMETRY.items()},
+        "arch_choices": {k: list(_ARCH_GEOMETRY[k]) for k in args.arch_choices},
         "train_fraction": args.train_fraction,
         "val_n_speakers": args.val_n_speakers,
         "val_speakers": list(args.val_speakers) if args.val_speakers is not None else None,
@@ -460,7 +461,9 @@ def parse_args():
     )
     tunable.add_argument("--lr", nargs="+", default=["1e-4", "1e-2", "log"], metavar="VAL",
                          help="Learning rate (default tune log-uniform [1e-4, 1e-2]).")
-    tunable.add_argument("--loss_temperature", nargs="+", default=["1.0", "8.0"], metavar="VAL")
+    tunable.add_argument("--loss_temperature", nargs="+", default=["0.05", "5.0", "log"], metavar="VAL",
+                         help="Softmax temperature (default tune log-uniform [0.05, 5.0]; "
+                              "earlier runs favored low temp ~0.1).")
     tunable.add_argument("--loss_label_smoothing", nargs="+", default=["0.0", "0.3"], metavar="VAL")
     tunable.add_argument("--beta_s", nargs="+", default=["0.05", "5.0"], metavar="VAL",
                          help="Somatic surrogate gradient scale (default tune [0.05, 5.0]).")
@@ -495,6 +498,10 @@ def parse_args():
                      help="Min channel-shift range (collapsed units).")
     geo.add_argument("--channel_shift_max", type=int, default=7,
                      help="Max channel-shift range (collapsed units).")
+    geo.add_argument("--arch_choices", nargs="+", choices=list(_ARCH_GEOMETRY.keys()),
+                     default=list(_ARCH_GEOMETRY.keys()), metavar="ARCH",
+                     help="Architectures to search (default both). Pass a single value "
+                          "(e.g. --arch_choices one_layer) for a per-architecture sweep.")
 
     # ---- memory management (binned combos are multiple GB each) ----
     mem = p.add_argument_group("memory")
@@ -510,7 +517,9 @@ def parse_args():
 
     # ---- Optuna study settings ----
     study = p.add_argument_group("optuna study")
-    study.add_argument("--n_trials", type=int, default=300)
+    study.add_argument("--n_trials", type=int, default=100,
+                       help="Trials per invocation (study resumes/accumulates, so "
+                            "rerunning the same command adds another batch).")
     study.add_argument("--n_jobs", type=int, default=1,
                        help="Parallel Optuna workers (use 1 with JAX).")
     study.add_argument("--study_name", default="shd_optuna_big")
@@ -556,7 +565,7 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--gradient_clip", type=float, default=5.0)
-    p.add_argument("--weight_scale", type=float, default=0.25)
+    p.add_argument("--weight_scale", type=float, default=0.5)
     p.add_argument("--tau_soma", type=float, default=15.0)
     p.add_argument("--tau_dend", type=float, default=15.0)
     p.add_argument("--tau_m", type=float, default=20.0)
@@ -574,8 +583,9 @@ def parse_args():
     # LR-scheduler knobs are flag-driven tunables (1/2/3 values), static by default.
     p.add_argument("--lr_factor", nargs="+", default=["0.7"], metavar="VAL",
                    help="ReduceLROnPlateau multiplier (lr := lr * factor). 1.0 disables.")
-    p.add_argument("--lr_patience", nargs="+", default=["5"], metavar="VAL",
-                   help="Epochs without val improvement before an LR drop (rounded to int).")
+    p.add_argument("--lr_patience", nargs="+", default=["1", "8"], metavar="VAL",
+                   help="Epochs without val improvement before an LR drop (rounded to int). "
+                        "Default tune uniform [1, 8].")
     p.add_argument("--lr_min", type=float, default=1e-6)
     p.add_argument("--early_stop_patience", type=int, default=0,
                    help="0 (default, recommended for long runs) disables early stopping.")
@@ -617,7 +627,7 @@ def main():
     print(f"  {'bin_size_ms':25s}  categorical {list(args.bin_size_choices)} (ms; sets NeuronConfig dt)")
     print(f"  {'collapse_factor':25s}  categorical {list(args.collapse_choices)}")
     print(f"  {'channel_shift_range':25s}  int [{args.channel_shift_min}, {args.channel_shift_max}] (collapsed units)")
-    print(f"  {'arch':25s}  categorical { {k: list(v) for k, v in _ARCH_GEOMETRY.items()} }")
+    print(f"  {'arch':25s}  categorical { {k: list(_ARCH_GEOMETRY[k]) for k in args.arch_choices} }")
     print(f"  {'loss_count_bias':25s}  EXCLUDED (no-op: constant added to all logits before softmax)")
     print(f"  {'augment_channel_shift':25s}  {args.augment_channel_shift}")
     print(flush=True)
