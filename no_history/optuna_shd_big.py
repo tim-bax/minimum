@@ -31,8 +31,11 @@ If a flag is omitted, the built-in default is used.
 """
 import argparse
 import datetime
+import gc
+import math
 import os
 import sys
+from collections import OrderedDict
 
 import optuna
 
@@ -74,6 +77,38 @@ _ARCH_GEOMETRY = {
     "one_layer": (128, 0),
     "two_layer": (64, 42),
 }
+
+# SHD raw input channel count (before collapse).
+_SHD_RAW_CHANNELS = 700
+
+
+def _estimate_combo_gb(n_total, bin_size_ms, collapse_factor,
+                       max_duration_ms=1400.0, bytes_per=4):
+    """Estimate the RESIDENT size (GB) of one binned (train+test) SHD combo.
+
+    The loader returns dense float arrays of shape (N, T_bins, n_channels) with
+    T_bins = ceil(max_duration_ms / bin_size_ms) and
+    n_channels = ceil(700 / collapse_factor). Peak during load is ~1.8x this
+    (the loader builds a per-sample list then np.stacks it).
+    """
+    t_bins = math.ceil(max_duration_ms / bin_size_ms)
+    n_channels = math.ceil(_SHD_RAW_CHANNELS / collapse_factor)
+    return n_total * t_bins * n_channels * bytes_per / 1e9
+
+
+def _evict_to_cap(cache, cap):
+    """Evict oldest entries from an LRU OrderedDict until len(cache) < cap.
+
+    Frees the (large) SHD arrays before a new combo is loaded so peaks don't
+    overlap. Returns the list of evicted keys (oldest-first).
+    """
+    evicted = []
+    while len(cache) >= max(1, cap):
+        key, _ = cache.popitem(last=False)
+        evicted.append(key)
+    if evicted:
+        gc.collect()
+    return evicted
 
 
 def parse_param(name, values):
@@ -311,8 +346,22 @@ def resolve_params(trial, args):
     return params
 
 
-def run_trial(trial, args, get_split_data, fixed_config):
+def run_trial(trial, args, get_split_data, fixed_config, n_total):
     params = resolve_params(trial, args)
+
+    # Memory guard: skip combos whose binned arrays would exceed the budget,
+    # so an un-runnable (bin, collapse) is pruned cleanly instead of OOM-killing
+    # the whole study. Off when --max_combo_gb <= 0.
+    if args.max_combo_gb and args.max_combo_gb > 0:
+        bytes_per = 8 if args.precision == "64" else 4
+        est = _estimate_combo_gb(n_total, params["bin_size_ms"],
+                                 params["collapse_factor"], args.max_duration_ms, bytes_per)
+        if est > args.max_combo_gb:
+            print(f"\n--- Trial {trial.number + 1}/{args.n_trials}: SKIP "
+                  f"bin={params['bin_size_ms']}ms collapse={params['collapse_factor']} "
+                  f"(~{est:.1f}GB > --max_combo_gb {args.max_combo_gb}) ---", flush=True)
+            raise optuna.exceptions.TrialPruned()
+
     train_subset, _train_pool, val_data, _test_data, n_inputs = get_split_data(
         params["bin_size_ms"], params["collapse_factor"]
     )
@@ -446,6 +495,18 @@ def parse_args():
                      help="Min channel-shift range (collapsed units).")
     geo.add_argument("--channel_shift_max", type=int, default=7,
                      help="Max channel-shift range (collapsed units).")
+
+    # ---- memory management (binned combos are multiple GB each) ----
+    mem = p.add_argument_group("memory")
+    mem.add_argument("--max_cached_binnings", type=int, default=1,
+                     help="Max distinct (bin,collapse) combos kept resident at once "
+                          "(LRU; oldest freed + gc'd before a new load). Default 1 = "
+                          "one combo at a time (prevents the per-trial accumulation OOM).")
+    mem.add_argument("--max_combo_gb", type=float, default=0.0,
+                     help="If >0, prune any trial whose (bin,collapse) binned arrays "
+                          "would exceed this estimated resident GB, instead of OOM-killing "
+                          "the study. Default 0 = off (full grid fits on a 128GB box at "
+                          "cache cap 1).")
 
     # ---- Optuna study settings ----
     study = p.add_argument_group("optuna study")
@@ -602,6 +663,7 @@ def main():
 
     boot_train, boot_test, boot_spk = _load_combo(boot_bin, boot_collapse)
     n_samples = len(boot_train)
+    n_total = n_samples + len(boot_test)  # train+test, for memory estimates
 
     # --- compute the (binning-independent) validation split indices once ---
     if use_speakers:
@@ -646,12 +708,28 @@ def main():
         flush=True,
     )
 
+    # --- startup estimate table: resident GB per (bin, collapse) combo ---
+    bytes_per = 8 if args.precision == "64" else 4
+    print(f"\nEstimated resident size per (bin, collapse) combo "
+          f"(train+test, float{args.precision}; peak during load ~1.8x):", flush=True)
+    for b in sorted(args.bin_size_choices):
+        cells = "  ".join(
+            f"c{c}={_estimate_combo_gb(n_total, b, c, args.max_duration_ms, bytes_per):5.1f}GB"
+            for c in sorted(args.collapse_choices)
+        )
+        print(f"  bin={b:>4}ms  {cells}", flush=True)
+    print(f"  cache cap (--max_cached_binnings): {args.max_cached_binnings}  "
+          f"| guard (--max_combo_gb): {args.max_combo_gb or 'off'}\n", flush=True)
+
     # ------------------------------------------------------------------
-    # Per-(bin, collapse) split cache. Index sets above are binning-independent
-    # because load_shd_binned's sample order is deterministic across binnings;
-    # we assert that invariant once per combo (speaker mode).
+    # Per-(bin, collapse) split cache (bounded LRU). Index sets above are
+    # binning-independent because load_shd_binned's sample order is deterministic
+    # across binnings; we assert that invariant once per combo (speaker mode).
+    # The cache is capped at --max_cached_binnings combos: each binned combo is
+    # multiple GB, so we evict + gc the oldest BEFORE loading a new one (no
+    # peak overlap) to keep resident memory flat across trials.
     # ------------------------------------------------------------------
-    _SPLIT_CACHE = {}
+    _SPLIT_CACHE = OrderedDict()
 
     def _slice_split(train_data, test_data):
         val_data = [train_data[i] for i in val_idx]
@@ -662,19 +740,29 @@ def main():
 
     def get_split_data(bin_size_ms, collapse_factor):
         key = (int(collapse_factor), float(bin_size_ms))
-        if key not in _SPLIT_CACHE:
-            train_data, test_data, spk_tr = _load_combo(bin_size_ms, collapse_factor)
-            if use_speakers:
-                assert np.array_equal(np.asarray(spk_tr), np.asarray(boot_spk)), (
-                    "SHD sample order changed across binning "
-                    f"(bin={bin_size_ms}, collapse={collapse_factor}); "
-                    "split indices would be invalid."
-                )
-            _SPLIT_CACHE[key] = _slice_split(train_data, test_data)
+        if key in _SPLIT_CACHE:
+            _SPLIT_CACHE.move_to_end(key)  # mark most-recently-used
+            return _SPLIT_CACHE[key]
+        # Free old combos (and run gc) before the new ~GB-scale load peaks.
+        _evict_to_cap(_SPLIT_CACHE, args.max_cached_binnings)
+        est = _estimate_combo_gb(n_total, bin_size_ms, collapse_factor,
+                                 args.max_duration_ms, bytes_per)
+        print(f"   [data] loading combo bin={bin_size_ms}ms collapse={collapse_factor} "
+              f"(~{est:.1f}GB resident) ...", flush=True)
+        train_data, test_data, spk_tr = _load_combo(bin_size_ms, collapse_factor)
+        if use_speakers:
+            assert np.array_equal(np.asarray(spk_tr), np.asarray(boot_spk)), (
+                "SHD sample order changed across binning "
+                f"(bin={bin_size_ms}, collapse={collapse_factor}); "
+                "split indices would be invalid."
+            )
+        _SPLIT_CACHE[key] = _slice_split(train_data, test_data)
         return _SPLIT_CACHE[key]
 
-    # seed the bootstrap binning's split so it isn't re-binned
+    # Seed the bootstrap binning's split so it isn't re-binned, then drop the
+    # local refs so the cache holds the ONLY reference (evictable -> freeable).
     _SPLIT_CACHE[(int(boot_collapse), float(boot_bin))] = _slice_split(boot_train, boot_test)
+    del boot_train, boot_test
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -722,7 +810,7 @@ def main():
     print(flush=True)
 
     def objective(trial):
-        return run_trial(trial, args, get_split_data, fixed_config)
+        return run_trial(trial, args, get_split_data, fixed_config, n_total)
 
     print(f"Starting Optuna study '{args.study_name}' "
           f"({args.n_trials} trials, up to {args.epochs} epochs each, "
