@@ -35,6 +35,7 @@ import gc
 import math
 import os
 import sys
+import time
 from collections import OrderedDict
 
 import optuna
@@ -245,6 +246,7 @@ def train_and_eval(params, args, train_set, eval_set, n_inputs, seed,
     for epoch in range(1, args.epochs + 1):
         idx = np.random.permutation(n_train)
 
+        epoch_t0 = time.time()
         for bi in range(n_batches):
             start = bi * B
             batch_idx = idx[start: start + B]
@@ -265,8 +267,11 @@ def train_and_eval(params, args, train_set, eval_set, n_inputs, seed,
                 net.batch_train_step(
                     x_batch, y_batch, lr=current_lr, clip_value=args.gradient_clip,
                 )
+        train_elapsed = time.time() - epoch_t0
+        sps = (n_batches * B) / max(train_elapsed, 1e-6)
 
         acc = evaluate(net, eval_set, B)
+        epoch_elapsed = time.time() - epoch_t0
 
         improved = acc > best_acc
         if improved:
@@ -281,7 +286,7 @@ def train_and_eval(params, args, train_set, eval_set, n_inputs, seed,
             marker = "*" if improved else " "
             print(
                 f"  Epoch {epoch:3d}/{args.epochs}  {eval_label}_acc={acc:.2f}%{marker}"
-                f"  lr={current_lr:.2e}",
+                f"  lr={current_lr:.2e}  | {sps:.0f} samples/s ({epoch_elapsed:.1f}s)",
                 flush=True,
             )
 
@@ -563,7 +568,9 @@ def parse_args():
     p.add_argument("--n_outputs", type=int, default=20)
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--batch_size", type=int, default=1)
+    p.add_argument("--batch_size", type=int, default=16,
+                   help="Training & eval batch size (default 16, matching the usual "
+                        "run_shd.py regime; batches both batch_train_step and the val pass).")
     p.add_argument("--gradient_clip", type=float, default=5.0)
     p.add_argument("--weight_scale", type=float, default=0.5)
     p.add_argument("--tau_soma", type=float, default=15.0)
