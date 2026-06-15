@@ -6,6 +6,13 @@ from two_comp_neuron import TwoCompNeuron
 from lif_neuron import LINeuron
 
 
+def _make_rf_mask(n_hidden, n_inputs, rf_width):
+    """Boolean mask (n_hidden, n_inputs): neuron i connects to inputs i..i+rf_width-1."""
+    rows = jnp.arange(n_hidden)[:, None]
+    cols = jnp.arange(n_inputs)[None, :]
+    return (cols >= rows) & (cols < rows + rf_width)
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  Core functions — each processes ONE sample.
 #
@@ -652,6 +659,7 @@ class Network:
         dropout_rate: float = 0.0,
         weight_decay: float = 0.0,
         n_hidden2: int = 0,
+        rf_width: int = 0,
     ):
         self.n_inputs = n_inputs
         self.n_hidden = n_hidden
@@ -673,6 +681,17 @@ class Network:
             self.hidden = TwoCompNeuron(key_h, n_hidden, n_inputs, config)
             self.readout = LINeuron(key_r, n_outputs, n_hidden, config)
         self.rng_key = key_rng
+
+        if rf_width > 0:
+            self.rf_mask = _make_rf_mask(n_hidden, n_inputs, rf_width)
+            if self.two_layer:
+                self.hidden1.w_dend = jnp.where(self.rf_mask, self.hidden1.w_dend, 0.0)
+                self.hidden1.w_soma = jnp.where(self.rf_mask, self.hidden1.w_soma, 0.0)
+            else:
+                self.hidden.w_dend = jnp.where(self.rf_mask, self.hidden.w_dend, 0.0)
+                self.hidden.w_soma = jnp.where(self.rf_mask, self.hidden.w_soma, 0.0)
+        else:
+            self.rf_mask = None
 
         if optimizer == "adam":
             self.beta1 = beta1
@@ -809,6 +828,9 @@ class Network:
             self.hidden.w_dend, self.hidden.w_soma, self.readout.w = _apply(
                 *self._weights(), g_d, g_s, g_r, lr, clip_value, self.weight_decay,
             )
+        if self.rf_mask is not None:
+            self.hidden.w_dend = jnp.where(self.rf_mask, self.hidden.w_dend, 0.0)
+            self.hidden.w_soma = jnp.where(self.rf_mask, self.hidden.w_soma, 0.0)
 
     def _update_weights_2l(self, g_d1, g_s1, g_d2, g_s2, g_r, lr, clip_value):
         """Apply the 5 two-layer gradients with the configured optimizer."""
@@ -832,6 +854,9 @@ class Network:
                 *self._weights2(), g_d1, g_s1, g_d2, g_s2, g_r,
                 lr, clip_value, self.weight_decay,
             )
+        if self.rf_mask is not None:
+            self.hidden1.w_dend = jnp.where(self.rf_mask, self.hidden1.w_dend, 0.0)
+            self.hidden1.w_soma = jnp.where(self.rf_mask, self.hidden1.w_soma, 0.0)
 
     # ── Single-sample API ──
 

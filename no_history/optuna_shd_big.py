@@ -73,9 +73,10 @@ from network import Network
 from data.shd_binned import load_shd_binned, apply_channel_shift
 
 
-# 1x128 vs 2x(64->42): map the arch label to (n_hidden, n_hidden2).
+# 1x150 vs 2x(64->42): map the arch label to (n_hidden, n_hidden2).
+# one_layer width is 150 to match the run_shd.py regime this sweep is built around.
 _ARCH_GEOMETRY = {
-    "one_layer": (128, 0),
+    "one_layer": (150, 0),
     "two_layer": (64, 42),
 }
 
@@ -214,7 +215,7 @@ def train_and_eval(params, args, train_set, eval_set, n_inputs, seed,
         gamma=params["gamma"],
         beta_s=params["beta_s"],
         beta_d=params["beta_d"],
-        weight_scale=args.weight_scale,
+        weight_scale=params["weight_scale"],
         loss_temperature=params["loss_temperature"],
         loss_label_smoothing=params["loss_label_smoothing"],
         # loss_count_bias intentionally left at its default: it is a no-op
@@ -332,13 +333,15 @@ def resolve_params(trial, args):
         "tau_plat_max": suggest_or_static(trial, "tau_plat_max", args.tau_plat_max),
         "lr_factor": suggest_or_static(trial, "lr_factor", args.lr_factor),
         "lr_patience": suggest_or_static(trial, "lr_patience", args.lr_patience),
+        "weight_scale": suggest_or_static(trial, "weight_scale", args.weight_scale),
     }
 
     # --- newly-tuned data geometry / augmentation / architecture ---
-    # bin_size and collapse are small categorical grids: each distinct combo
-    # forces a one-time re-bin (cached in _SPLIT_CACHE), so keep them discrete.
+    # bin_size, collapse and max_duration are small categorical grids: each distinct
+    # combo forces a one-time re-bin (cached in _SPLIT_CACHE), so keep them discrete.
     params["bin_size_ms"] = trial.suggest_categorical("bin_size_ms", args.bin_size_choices)
     params["collapse_factor"] = trial.suggest_categorical("collapse_factor", args.collapse_choices)
+    params["max_duration_ms"] = trial.suggest_categorical("max_duration_ms", args.max_duration_choices)
     # channel-shift directly in collapsed units (no collapse mapping).
     params["channel_shift_range"] = trial.suggest_int(
         "channel_shift_range", args.channel_shift_min, args.channel_shift_max)
@@ -361,15 +364,16 @@ def run_trial(trial, args, get_split_data, fixed_config, n_total):
     if args.max_combo_gb and args.max_combo_gb > 0:
         bytes_per = 8 if args.precision == "64" else 4
         est = _estimate_combo_gb(n_total, params["bin_size_ms"],
-                                 params["collapse_factor"], args.max_duration_ms, bytes_per)
+                                 params["collapse_factor"], params["max_duration_ms"], bytes_per)
         if est > args.max_combo_gb:
             print(f"\n--- Trial {trial.number + 1}/{args.n_trials}: SKIP "
                   f"bin={params['bin_size_ms']}ms collapse={params['collapse_factor']} "
+                  f"max_dur={params['max_duration_ms']}ms "
                   f"(~{est:.1f}GB > --max_combo_gb {args.max_combo_gb}) ---", flush=True)
             raise optuna.exceptions.TrialPruned()
 
     train_subset, _train_pool, val_data, _test_data, n_inputs = get_split_data(
-        params["bin_size_ms"], params["collapse_factor"]
+        params["bin_size_ms"], params["collapse_factor"], params["max_duration_ms"]
     )
     trial.set_user_attr("params", params)
     # Record the fixed (non-tunable) geometry this trial ran under, so the trial
@@ -379,9 +383,11 @@ def run_trial(trial, args, get_split_data, fixed_config, n_total):
     print(
         f"\n--- Trial {trial.number + 1}/{args.n_trials} ---"
         f"  bin={params['bin_size_ms']}ms  collapse={params['collapse_factor']}"
+        f"  max_dur={params['max_duration_ms']}ms"
         f"  arch={params['arch']}(n_hidden={params['n_hidden']},n_hidden2={params['n_hidden2']})"
         f"  ch_shift={params['channel_shift_range']}  n_inputs={n_inputs}"
         f"\n     lr={params['lr']:.4g}  temp={params['loss_temperature']:.4g}"
+        f"  wscale={params['weight_scale']:.4g}"
         f"  smooth={params['loss_label_smoothing']:.4g}"
         f"  beta_s={params['beta_s']:.4g}  beta_d={params['beta_d']:.4g}"
         f"  a={params['a_adapt']:.4g}  b={params['b_adapt']:.4g}",
@@ -398,18 +404,16 @@ def run_trial(trial, args, get_split_data, fixed_config, n_total):
 def build_fixed_config(args):
     """Capture every non-tunable run setting as a JSON-serializable dict.
 
-    The per-trial geometry (bin_size_ms, collapse_factor, n_hidden, arch,
-    channel_shift_range) is NOT here — it lives on each trial's `params`. Instead
-    we record the SEARCH SPACE for those, so the DB is self-documenting and a
-    resume with the same search space doesn't trigger a false "not
-    apples-to-apples" warning.
+    The per-trial geometry (bin_size_ms, collapse_factor, max_duration_ms,
+    n_hidden, arch, channel_shift_range, weight_scale) is NOT here — it lives on
+    each trial's `params`. Instead we record the SEARCH SPACE for those, so the DB
+    is self-documenting and a resume with the same search space doesn't trigger a
+    false "not apples-to-apples" warning.
     """
     return {
-        "max_duration_ms": args.max_duration_ms,
         "binarize": bool(args.binarize),
         "input_scale": args.input_scale,
         "n_outputs": args.n_outputs,
-        "weight_scale": args.weight_scale,
         "tau_soma": args.tau_soma,
         "tau_dend": args.tau_dend,
         "tau_m": args.tau_m,
@@ -429,6 +433,7 @@ def build_fixed_config(args):
         # search-space records for the now-per-trial geometry:
         "bin_size_choices": list(args.bin_size_choices),
         "collapse_choices": list(args.collapse_choices),
+        "max_duration_choices": list(args.max_duration_choices),
         "channel_shift_range_bounds": [args.channel_shift_min, args.channel_shift_max],
         "arch_choices": {k: list(_ARCH_GEOMETRY[k]) for k in args.arch_choices},
         "train_fraction": args.train_fraction,
@@ -447,7 +452,7 @@ _TUNABLE_NAMES = [
     "lr", "loss_temperature", "loss_label_smoothing", "beta_s", "beta_d",
     "tau_w", "a_adapt", "b_adapt", "dropout", "weight_decay",
     "mu_th", "gamma", "tau_plat_min", "tau_plat_max",
-    "lr_factor", "lr_patience",
+    "lr_factor", "lr_patience", "weight_scale",
 ]
 
 
@@ -492,6 +497,9 @@ def parse_args():
                          help="Plateau duration min (ms). Static by default.")
     tunable.add_argument("--tau_plat_max", nargs="+", default=["350.0"], metavar="VAL",
                          help="Plateau duration max (ms). Static by default.")
+    tunable.add_argument("--weight_scale", nargs="+", default=["0.5"], metavar="VAL",
+                         help="Input-weight init scale (sets firing rate / logit "
+                              "magnitude; couples with loss_temperature). Static by default.")
 
     # ---- newly-searched geometry / augmentation / architecture grids ----
     geo = p.add_argument_group("searched geometry / architecture")
@@ -499,6 +507,11 @@ def parse_args():
                      metavar="MS", help="Categorical bin sizes (ms) to search.")
     geo.add_argument("--collapse_choices", type=int, nargs="+", default=[1, 2, 3, 4, 5],
                      metavar="K", help="Categorical collapse factors to search.")
+    geo.add_argument("--max_duration_choices", type=float, nargs="+",
+                     default=[800, 1000, 1400], metavar="MS",
+                     help="Categorical truncation windows (ms) to search. Each value "
+                          "reshapes T (= ceil(max_duration_ms / bin_size_ms)) and forces "
+                          "a one-time re-bin per (bin, collapse, max_duration) combo.")
     geo.add_argument("--channel_shift_min", type=int, default=0,
                      help="Min channel-shift range (collapsed units).")
     geo.add_argument("--channel_shift_max", type=int, default=7,
@@ -531,6 +544,13 @@ def parse_args():
     study.add_argument("--storage", default=None,
                        help="Optuna storage URL, e.g. sqlite:///shd_big.db. "
                             "Default: in-memory (not persistent).")
+    study.add_argument("--enqueue", action="append", default=None, metavar="K=V,...",
+                       help="Warm-start: enqueue a starting trial with these param "
+                            "values (repeatable). E.g. "
+                            "--enqueue \"mu_th=1.0,gamma=0.5,lr=3.3e-4\". Keys must be "
+                            "SEARCHED params (those given a range); values should sit "
+                            "inside the search range. Skipped if an identical trial "
+                            "already exists in the study.")
     study.add_argument("--prune", action="store_true",
                        help="Enable MedianPruner (OFF by default). Even then, warmup "
                             "defaults to most of the horizon so slow-but-better trials survive.")
@@ -562,7 +582,8 @@ def parse_args():
                              "Top-K are re-validated on the FULL pool at the end.")
 
     # ---- fixed model / data settings ----
-    p.add_argument("--max_duration_ms", type=float, default=1400.0)
+    # NOTE: max_duration_ms and weight_scale are now per-trial search dimensions
+    # (see --max_duration_choices and the --weight_scale tunable above).
     p.add_argument("--binarize", action="store_true")
     p.add_argument("--input_scale", type=float, default=1.0)
     p.add_argument("--n_outputs", type=int, default=20)
@@ -572,7 +593,6 @@ def parse_args():
                    help="Training & eval batch size (default 16, matching the usual "
                         "run_shd.py regime; batches both batch_train_step and the val pass).")
     p.add_argument("--gradient_clip", type=float, default=5.0)
-    p.add_argument("--weight_scale", type=float, default=0.5)
     p.add_argument("--tau_soma", type=float, default=15.0)
     p.add_argument("--tau_dend", type=float, default=15.0)
     p.add_argument("--tau_m", type=float, default=20.0)
@@ -633,6 +653,7 @@ def main():
         print(f"  {name:25s}  {_describe_param(name, vals)}")
     print(f"  {'bin_size_ms':25s}  categorical {list(args.bin_size_choices)} (ms; sets NeuronConfig dt)")
     print(f"  {'collapse_factor':25s}  categorical {list(args.collapse_choices)}")
+    print(f"  {'max_duration_ms':25s}  categorical {list(args.max_duration_choices)} (ms; truncation window, sets T)")
     print(f"  {'channel_shift_range':25s}  int [{args.channel_shift_min}, {args.channel_shift_max}] (collapsed units)")
     print(f"  {'arch':25s}  categorical { {k: list(_ARCH_GEOMETRY[k]) for k in args.arch_choices} }")
     print(f"  {'loss_count_bias':25s}  EXCLUDED (no-op: constant added to all logits before softmax)")
@@ -646,22 +667,23 @@ def main():
     val_seed = args.val_seed if args.val_seed is not None else args.seed
 
     # ------------------------------------------------------------------
-    # Bootstrap load at the CHEAPEST binning (largest bin, largest collapse)
-    # purely to (a) learn the stable sample order / count and speaker labels,
-    # and (b) compute the binning-INDEPENDENT split index sets ONCE. The
-    # bootstrap split is then seeded into the cache so it isn't re-binned.
+    # Bootstrap load at the CHEAPEST binning (largest bin, largest collapse,
+    # smallest window) purely to (a) learn the stable sample order / count and
+    # speaker labels, and (b) compute the binning-INDEPENDENT split index sets
+    # ONCE. The bootstrap split is then seeded into the cache so it isn't re-binned.
     # ------------------------------------------------------------------
     boot_bin = max(args.bin_size_choices)
     boot_collapse = max(args.collapse_choices)
-    print(f"Loading SHD data (bootstrap binning bin={boot_bin}ms collapse={boot_collapse}) ...",
-          flush=True)
+    boot_max_dur = min(args.max_duration_choices)
+    print(f"Loading SHD data (bootstrap binning bin={boot_bin}ms collapse={boot_collapse} "
+          f"max_dur={boot_max_dur}ms) ...", flush=True)
 
-    def _load_combo(bin_size_ms, collapse_factor):
+    def _load_combo(bin_size_ms, collapse_factor, max_duration_ms):
         """Load + bin SHD at one geometry; return (train_data, test_data, spk_tr)."""
         loaded = load_shd_binned(
             bin_size_ms=bin_size_ms,
             collapse_factor=collapse_factor,
-            max_duration_ms=args.max_duration_ms,
+            max_duration_ms=max_duration_ms,
             binarize=args.binarize,
             dtype=dtype,
             return_speakers=use_speakers,
@@ -678,7 +700,7 @@ def main():
         test_data = [(X_te[i], int(y_te[i])) for i in range(len(y_te))]
         return train_data, test_data, spk_tr
 
-    boot_train, boot_test, boot_spk = _load_combo(boot_bin, boot_collapse)
+    boot_train, boot_test, boot_spk = _load_combo(boot_bin, boot_collapse, boot_max_dur)
     n_samples = len(boot_train)
     n_total = n_samples + len(boot_test)  # train+test, for memory estimates
 
@@ -725,26 +747,31 @@ def main():
         flush=True,
     )
 
-    # --- startup estimate table: resident GB per (bin, collapse) combo ---
+    # --- startup estimate table: resident GB per (bin, collapse) combo, at the
+    #     LARGEST window (worst case for memory; the guard keys off the per-trial
+    #     max_duration but this is the upper bound a combo can hit). ---
     bytes_per = 8 if args.precision == "64" else 4
-    print(f"\nEstimated resident size per (bin, collapse) combo "
+    worst_max_dur = max(args.max_duration_choices)
+    print(f"\nEstimated resident size per (bin, collapse) combo at the largest "
+          f"window ({worst_max_dur}ms) "
           f"(train+test, float{args.precision}; peak during load ~1.8x):", flush=True)
     for b in sorted(args.bin_size_choices):
         cells = "  ".join(
-            f"c{c}={_estimate_combo_gb(n_total, b, c, args.max_duration_ms, bytes_per):5.1f}GB"
+            f"c{c}={_estimate_combo_gb(n_total, b, c, worst_max_dur, bytes_per):5.1f}GB"
             for c in sorted(args.collapse_choices)
         )
         print(f"  bin={b:>4}ms  {cells}", flush=True)
-    print(f"  cache cap (--max_cached_binnings): {args.max_cached_binnings}  "
+    print(f"  windows searched (--max_duration_choices): {sorted(args.max_duration_choices)}  "
+          f"| cache cap (--max_cached_binnings): {args.max_cached_binnings}  "
           f"| guard (--max_combo_gb): {args.max_combo_gb or 'off'}\n", flush=True)
 
     # ------------------------------------------------------------------
-    # Per-(bin, collapse) split cache (bounded LRU). Index sets above are
-    # binning-independent because load_shd_binned's sample order is deterministic
-    # across binnings; we assert that invariant once per combo (speaker mode).
-    # The cache is capped at --max_cached_binnings combos: each binned combo is
-    # multiple GB, so we evict + gc the oldest BEFORE loading a new one (no
-    # peak overlap) to keep resident memory flat across trials.
+    # Per-(collapse, bin, max_duration) split cache (bounded LRU). Index sets
+    # above are binning-independent because load_shd_binned's sample order is
+    # deterministic across binnings; we assert that invariant once per combo
+    # (speaker mode). The cache is capped at --max_cached_binnings combos: each
+    # binned combo is multiple GB, so we evict + gc the oldest BEFORE loading a
+    # new one (no peak overlap) to keep resident memory flat across trials.
     # ------------------------------------------------------------------
     _SPLIT_CACHE = OrderedDict()
 
@@ -755,22 +782,22 @@ def main():
         n_inputs = train_pool[0][0].shape[1]
         return (train_subset, train_pool, val_data, test_data, n_inputs)
 
-    def get_split_data(bin_size_ms, collapse_factor):
-        key = (int(collapse_factor), float(bin_size_ms))
+    def get_split_data(bin_size_ms, collapse_factor, max_duration_ms):
+        key = (int(collapse_factor), float(bin_size_ms), float(max_duration_ms))
         if key in _SPLIT_CACHE:
             _SPLIT_CACHE.move_to_end(key)  # mark most-recently-used
             return _SPLIT_CACHE[key]
         # Free old combos (and run gc) before the new ~GB-scale load peaks.
         _evict_to_cap(_SPLIT_CACHE, args.max_cached_binnings)
         est = _estimate_combo_gb(n_total, bin_size_ms, collapse_factor,
-                                 args.max_duration_ms, bytes_per)
+                                 max_duration_ms, bytes_per)
         print(f"   [data] loading combo bin={bin_size_ms}ms collapse={collapse_factor} "
-              f"(~{est:.1f}GB resident) ...", flush=True)
-        train_data, test_data, spk_tr = _load_combo(bin_size_ms, collapse_factor)
+              f"max_dur={max_duration_ms}ms (~{est:.1f}GB resident) ...", flush=True)
+        train_data, test_data, spk_tr = _load_combo(bin_size_ms, collapse_factor, max_duration_ms)
         if use_speakers:
             assert np.array_equal(np.asarray(spk_tr), np.asarray(boot_spk)), (
                 "SHD sample order changed across binning "
-                f"(bin={bin_size_ms}, collapse={collapse_factor}); "
+                f"(bin={bin_size_ms}, collapse={collapse_factor}, max_dur={max_duration_ms}); "
                 "split indices would be invalid."
             )
         _SPLIT_CACHE[key] = _slice_split(train_data, test_data)
@@ -778,7 +805,8 @@ def main():
 
     # Seed the bootstrap binning's split so it isn't re-binned, then drop the
     # local refs so the cache holds the ONLY reference (evictable -> freeable).
-    _SPLIT_CACHE[(int(boot_collapse), float(boot_bin))] = _slice_split(boot_train, boot_test)
+    _SPLIT_CACHE[(int(boot_collapse), float(boot_bin), float(boot_max_dur))] = \
+        _slice_split(boot_train, boot_test)
     del boot_train, boot_test
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -826,6 +854,25 @@ def main():
         print(f"  {k:24s}  {v}")
     print(flush=True)
 
+    # --- warm-start: enqueue user-specified starting trials ---
+    if args.enqueue:
+        for spec in args.enqueue:
+            try:
+                d = {}
+                for kv in spec.split(","):
+                    name, val = kv.split("=", 1)
+                    d[name.strip()] = float(val)
+            except ValueError as e:
+                raise SystemExit(
+                    f"--enqueue: could not parse '{spec}' (expected \"k=v,k=v,...\"): {e}"
+                ) from e
+            try:
+                study.enqueue_trial(d, skip_if_exists=True)
+            except TypeError:  # older Optuna without skip_if_exists
+                study.enqueue_trial(d)
+            print(f"Enqueued warm-start trial: {d}", flush=True)
+        print(flush=True)
+
     def objective(trial):
         return run_trial(trial, args, get_split_data, fixed_config, n_total)
 
@@ -855,7 +902,7 @@ def main():
         # Re-fetch THIS trial's own binning on the full pool (cache hit unless
         # a rare combo was never touched during the study).
         _sub, train_pool, val_data, _test, n_inputs = get_split_data(
-            params["bin_size_ms"], params["collapse_factor"])
+            params["bin_size_ms"], params["collapse_factor"], params["max_duration_ms"])
         print(f"\n-- Re-validating trial #{t.number} "
               f"(subset val_acc={t.value:.2f}%)  params={params}", flush=True)
         full_val_acc, _ = train_and_eval(
@@ -870,7 +917,8 @@ def main():
     # Final test confirmation trains on ALL train speakers (pool + held-out val),
     # at the best trial's own binning, matching real deployment.
     _sub, train_pool, val_data, test_data, n_inputs = get_split_data(
-        best_params["bin_size_ms"], best_params["collapse_factor"])
+        best_params["bin_size_ms"], best_params["collapse_factor"],
+        best_params["max_duration_ms"])
     full_train = train_pool + val_data
     print(f"\n=== Best config (trial #{best_trial_no}, held-out val_acc={full_val_acc:.2f}%) — "
           f"retraining on ALL {len(full_train)} train samples, confirming on TEST once ===",

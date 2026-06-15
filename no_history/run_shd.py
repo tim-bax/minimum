@@ -156,6 +156,9 @@ def parse_args():
     p.add_argument("--early_stop_patience", type=int, default=0,
                    help="Stop training if no test-acc improvement for this many epochs. "
                         "0 disables.")
+    p.add_argument("--rf_width", type=int, default=0,
+                   help="Receptive field width in input channels. "
+                        "0 = all-to-all (default). Neuron i connects to inputs i..i+rf_width-1.")
     p.add_argument(
         "--precision",
         choices=["32", "64"],
@@ -266,6 +269,7 @@ def main():
         optimizer=args.optimizer, beta1=args.beta1, beta2=args.beta2, adam_eps=args.adam_eps,
         dropout_rate=args.dropout, weight_decay=args.weight_decay,
         n_hidden2=args.n_hidden2,
+        rf_width=args.rf_width,
     )
     opt_str = f"adam(β1={args.beta1},β2={args.beta2})" if args.optimizer == "adam" else "sgd"
     drop_str = f"  dropout={args.dropout}" if args.dropout > 0 else ""
@@ -276,6 +280,7 @@ def main():
     if args.augment_channel_shift:
         chan_shift_str = f"  augment_channel_shift=True(range=±{args.channel_shift_range})"
     wd_str = f"  weight_decay={args.weight_decay}" if args.weight_decay > 0 else ""
+    rf_str = f"  rf_width={args.rf_width}" if args.rf_width > 0 else ""
     if args.n_hidden2 > 0:
         arch_str = (f"{n_inputs} -> {args.n_hidden} (2-comp) -> "
                     f"{args.n_hidden2} (2-comp) -> {args.n_outputs} (LI readout)")
@@ -283,7 +288,7 @@ def main():
         arch_str = f"{n_inputs} -> {args.n_hidden} (2-comp) -> {args.n_outputs} (LI readout)"
     print(
         f"Network: {arch_str}  "
-        f"optimizer={opt_str}  lr={args.lr}{drop_str}{jitter_str}{chan_shift_str}{wd_str}",
+        f"optimizer={opt_str}  lr={args.lr}{drop_str}{jitter_str}{chan_shift_str}{wd_str}{rf_str}",
         flush=True,
     )
 
