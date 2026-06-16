@@ -15,6 +15,9 @@ class NeuronConfig:
     dt: float = 1.0
     tau_m: float = 20.0
     v_reset: float = 0.0
+    tau_w: float = 100.0
+    a_adapt: float = 0.0
+    b_adapt: float = 0.0
     beta_s: float = 0.36
     beta_d: float = 0.75
     weight_scale: float = 0.15

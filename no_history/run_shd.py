@@ -32,7 +32,7 @@ if _ROOT not in sys.path:
 if _SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _SCRIPT_DIR)
 
-from data.shd_binned import load_shd_binned
+from data.shd_binned import load_shd_binned, apply_channel_shift
 from config import NeuronConfig
 from network import Network
 
@@ -55,6 +55,15 @@ def apply_temporal_jitter(x_input, jitter_range: int):
     return out
 
 
+def augment_sample(x, args):
+    """Apply enabled training-time augmentations to one sample (training only)."""
+    if args.augment_jitter:
+        x = apply_temporal_jitter(x, args.jitter_range)
+    if args.augment_channel_shift:
+        x = apply_channel_shift(x, args.channel_shift_range)
+    return x
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="No-history model on SHD (count-bin preprocessing)")
     p.add_argument("--bin_size_ms", type=float, default=4.0,
@@ -68,6 +77,9 @@ def parse_args():
     p.add_argument("--input_scale", type=float, default=1.0,
                    help="Multiplicative scale on the binned input (default 1.0; raw counts).")
     p.add_argument("--n_hidden", type=int, default=64)
+    p.add_argument("--n_hidden2", type=int, default=0,
+                   help="Size of an optional second 2-comp hidden layer. "
+                        "0 (default) keeps the single-hidden-layer model.")
     p.add_argument("--n_outputs", type=int, default=20)
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
@@ -96,6 +108,12 @@ def parse_args():
                    help="Somatic spike threshold (default 1.0). Lower if neurons rarely spike.")
     p.add_argument("--gamma", type=float, default=0.5,
                    help="Plateau-induced threshold reduction (default 0.5). Effective v_th = v_th - gamma*h.")
+    p.add_argument("--tau_w", type=float, default=100.0,
+                   help="Adaptation current time constant (ms; default 100.0).")
+    p.add_argument("--a_adapt", type=float, default=0.0,
+                   help="Subthreshold adaptation coupling (default 0.0 = disabled).")
+    p.add_argument("--b_adapt", type=float, default=0.0,
+                   help="Spike-triggered adaptation jump size (default 0.0 = disabled).")
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument(
         "--augment_jitter",
@@ -107,6 +125,18 @@ def parse_args():
         type=int,
         default=10,
         help="Temporal jitter range in timesteps (uniform in [-range, +range]).",
+    )
+    p.add_argument(
+        "--augment_channel_shift",
+        action="store_true",
+        help="Enable channel-shift augmentation on training inputs only.",
+    )
+    p.add_argument(
+        "--channel_shift_range",
+        type=int,
+        default=5,
+        help="Channel-shift range in channels (uniform in [-range, +range]); "
+             "operates on the collapsed channel axis.",
     )
     p.add_argument("--weight_decay", type=float, default=0.0,
                    help="Decoupled weight decay (AdamW-style for Adam, "
@@ -126,6 +156,9 @@ def parse_args():
     p.add_argument("--early_stop_patience", type=int, default=0,
                    help="Stop training if no test-acc improvement for this many epochs. "
                         "0 disables.")
+    p.add_argument("--rf_width", type=int, default=0,
+                   help="Receptive field width in input channels. "
+                        "0 = all-to-all (default). Neuron i connects to inputs i..i+rf_width-1.")
     p.add_argument(
         "--precision",
         choices=["32", "64"],
@@ -168,6 +201,8 @@ def main():
         )
     if args.jitter_range < 0:
         raise ValueError("--jitter_range must be >= 0")
+    if args.channel_shift_range < 0:
+        raise ValueError("--channel_shift_range must be >= 0")
     np.random.seed(args.seed)
     key = random.PRNGKey(args.seed)
     B = args.batch_size
@@ -204,6 +239,9 @@ def main():
         tau_m=args.tau_m,
         tau_plat_min=args.tau_plat_min,
         tau_plat_max=args.tau_plat_max,
+        tau_w=args.tau_w,
+        a_adapt=args.a_adapt,
+        b_adapt=args.b_adapt,
         mu_th=args.mu_th,
         v_th=args.v_th,
         gamma=args.gamma,
@@ -230,16 +268,27 @@ def main():
         key, n_inputs, args.n_hidden, args.n_outputs, config,
         optimizer=args.optimizer, beta1=args.beta1, beta2=args.beta2, adam_eps=args.adam_eps,
         dropout_rate=args.dropout, weight_decay=args.weight_decay,
+        n_hidden2=args.n_hidden2,
+        rf_width=args.rf_width,
     )
     opt_str = f"adam(β1={args.beta1},β2={args.beta2})" if args.optimizer == "adam" else "sgd"
     drop_str = f"  dropout={args.dropout}" if args.dropout > 0 else ""
     jitter_str = ""
     if args.augment_jitter:
         jitter_str = f"  augment_jitter=True(range=±{args.jitter_range})"
+    chan_shift_str = ""
+    if args.augment_channel_shift:
+        chan_shift_str = f"  augment_channel_shift=True(range=±{args.channel_shift_range})"
     wd_str = f"  weight_decay={args.weight_decay}" if args.weight_decay > 0 else ""
+    rf_str = f"  rf_width={args.rf_width}" if args.rf_width > 0 else ""
+    if args.n_hidden2 > 0:
+        arch_str = (f"{n_inputs} -> {args.n_hidden} (2-comp) -> "
+                    f"{args.n_hidden2} (2-comp) -> {args.n_outputs} (LI readout)")
+    else:
+        arch_str = f"{n_inputs} -> {args.n_hidden} (2-comp) -> {args.n_outputs} (LI readout)"
     print(
-        f"Network: {n_inputs} -> {args.n_hidden} (2-comp) -> {args.n_outputs} (LIF readout)  "
-        f"optimizer={opt_str}  lr={args.lr}{drop_str}{jitter_str}{wd_str}",
+        f"Network: {arch_str}  "
+        f"optimizer={opt_str}  lr={args.lr}{drop_str}{jitter_str}{chan_shift_str}{wd_str}{rf_str}",
         flush=True,
     )
 
@@ -264,6 +313,11 @@ def main():
     log_interval = 1000
     log_every = max(1, log_interval // B)
 
+    # Fixed diagnostic batch (test samples, no augmentation) for per-epoch
+    # firing-rate readout.
+    diag_n = min(len(test_data), 128)
+    diag_x = jnp.stack([test_data[i][0] for i in range(diag_n)]) if diag_n else None
+
     current_lr = args.lr
     best_test_acc = 0.0
     best_epoch = 0
@@ -274,6 +328,8 @@ def main():
         idx = np.random.permutation(n_train)
         losses = []
         correct = 0
+        gnorm_sums = {}
+        gnorm_count = 0
         epoch_t0 = time.time()
         batch_t0 = time.time()
 
@@ -283,17 +339,14 @@ def main():
 
             if B == 1:
                 x, y = train_data[int(batch_idx[0])]
-                if args.augment_jitter:
-                    x = apply_temporal_jitter(x, args.jitter_range)
+                x = augment_sample(x, args)
                 loss, pred, gnorms = net.train_step(
                     jnp.array(x), int(y), lr=current_lr, clip_value=args.gradient_clip,
                 )
                 batch_correct = int(pred == int(y))
             else:
                 x_batch_np = [
-                    apply_temporal_jitter(train_data[int(i)][0], args.jitter_range)
-                    if args.augment_jitter
-                    else train_data[int(i)][0]
+                    augment_sample(train_data[int(i)][0], args)
                     for i in batch_idx
                 ]
                 x_batch = jnp.stack(x_batch_np)
@@ -305,6 +358,9 @@ def main():
 
             losses.append(loss)
             correct += batch_correct
+            for k, v in gnorms.items():
+                gnorm_sums[k] = gnorm_sums.get(k, 0.0) + v
+            gnorm_count += 1
 
             if bi == 0 and hasattr(dev, "memory_stats") and dev.memory_stats() is not None:
                 ms = dev.memory_stats()
@@ -352,6 +408,22 @@ def main():
             f"lr={current_lr:.2e} ({epoch_elapsed:.1f}s){marker}",
             flush=True,
         )
+
+        # Per-epoch gradient magnitudes (mean over batches) and firing rates.
+        if gnorm_count > 0:
+            key_order = (["dend1", "soma1", "dend2", "soma2", "readout"]
+                         if args.n_hidden2 > 0 else ["dend", "soma", "readout"])
+            gn_str = "  ".join(
+                f"{k}={gnorm_sums[k] / gnorm_count:.4g}"
+                for k in key_order if k in gnorm_sums
+            )
+            rate_str = ""
+            if diag_x is not None:
+                rates = net.activity(diag_x)
+                rate_str = "  | firing: " + "  ".join(
+                    f"{k}={v:.4f}" for k, v in rates.items()
+                )
+            print(f"         gnorms: {gn_str}{rate_str}", flush=True)
 
         if (args.lr_factor < 1.0
                 and args.lr_patience > 0
